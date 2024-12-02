@@ -21,6 +21,10 @@ struct Args {
     #[arg(default_value = ".")]
     base_dir: String,
 
+    /// Output directory (will be created if it doesn't exist)
+    #[arg(short = 'o', long)]
+    output_dir: Option<String>,
+
     /// SVT-AV1 preset (0-13, lower is better quality but slower)
     #[arg(short, long, default_value = "8")]
     preset: u32,
@@ -109,6 +113,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    // Create output directory if specified and doesn't exist
+    if let Some(ref output_dir) = args.output_dir {
+        fs::create_dir_all(output_dir)?;
+        println!("Output directory: {}", output_dir);
+    }
+
     println!("Starting AV1 encoding...");
     println!("Base directory: {}", args.base_dir);
     println!("SVT-AV1 preset: {}", args.preset);
@@ -135,28 +145,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Collect all video files and their frame counts
     println!("Scanning for MP4 files and counting frames...");
-    let mut video_files: Vec<VideoInfo> = Vec::new();
     let frame_scanning_pb = ProgressBar::new_spinner();
     frame_scanning_pb.set_style(ProgressStyle::default_spinner()
-        .template("{spinner:.green} {msg}").unwrap());
-    
-    for entry in WalkDir::new(&args.base_dir)
+        .template("{spinner:.green} Scanning: {msg} ({pos} files)").unwrap());
+    frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let mp4_files: Vec<_> = WalkDir::new(&args.base_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path().extension()
                 .map(|ext| ext.to_ascii_lowercase() == "mp4")
                 .unwrap_or(false)
-        }) {
-            frame_scanning_pb.set_message(format!("Scanning: {}", entry.path().display()));
-            if let Ok(frame_count) = get_frame_count(entry.path()) {
-                video_files.push(VideoInfo {
+        })
+        .collect();
+
+    let video_files: Vec<VideoInfo> = mp4_files.par_iter()
+        .filter_map(|entry| {
+            frame_scanning_pb.inc(1);
+            frame_scanning_pb.set_message(entry.path().display().to_string());
+            
+            match get_frame_count(entry.path()) {
+                Ok(frame_count) => Some(VideoInfo {
                     path: entry.path().to_string_lossy().into_owned(),
                     frame_count,
-                });
+                }),
+                Err(e) => {
+                    eprintln!("Failed to get frame count for {}: {}", entry.path().display(), e);
+                    None
+                }
             }
-    }
-    frame_scanning_pb.finish_and_clear();
+        })
+        .collect();
+
+    frame_scanning_pb.finish_with_message(format!("Scanned {} files", video_files.len()));
 
     let total_files = video_files.len();
     if total_files == 0 {
@@ -186,6 +208,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .for_each(|video| {
             match convert_to_av1(
                 &video.path, 
+		args.output_dir.as_deref(),
                 preset,
                 args.crf,
                 args.tune,
@@ -240,6 +263,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn convert_to_av1(
     input_path: &str,
+    output_dir: Option<&str>,
     preset: u32,
     crf: u32,
     tune: u32,
@@ -249,7 +273,11 @@ fn convert_to_av1(
     pb: &ProgressBar,
     frame_counter: Arc<AtomicUsize>
 ) -> Result<(), Box<dyn Error>> {
-    let output_path = Path::new(input_path).with_extension("mkv");
+    let input_path = Path::new(input_path);
+    let output_path = match output_dir {
+        Some(dir) => Path::new(dir).join(input_path.file_name().unwrap()).with_extension("mkv"),
+        None => input_path.with_extension("mkv"),
+    };
     
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-i")
@@ -321,20 +349,43 @@ fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
         .arg("error")
         .arg("-select_streams")
         .arg("v:0")
-        .arg("-count_packets")
         .arg("-show_entries")
-        .arg("stream=nb_read_packets")
+        .arg("stream=duration,r_frame_rate")
         .arg("-of")
-        .arg("csv=p=0")
+        .arg("json")
         .arg(path)
         .output()?;
 
-    let frame_count = String::from_utf8(output.stdout)?
-        .trim()
-        .parse::<usize>()?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        if let Some(stream) = streams.first() {
+            // Get duration
+            let duration = stream.get("duration")
+                .and_then(|d| d.as_str())
+                .and_then(|d| d.parse::<f64>().ok())
+                .ok_or("Could not parse duration")?;
 
-    Ok(frame_count)
+            // Parse frame rate which comes as "num/den" string
+            let r_frame_rate = stream.get("r_frame_rate")
+                .and_then(|r| r.as_str())
+                .ok_or("Could not get frame rate")?;
+            
+            let parts: Vec<f64> = r_frame_rate.split('/')
+                .map(|p| p.parse::<f64>())
+                .collect::<Result<Vec<f64>, _>>()?;
+            
+            if parts.len() == 2 && parts[1] != 0.0 {
+                let fps = parts[0] / parts[1];
+                let frame_count = (duration * fps).round() as usize;
+                return Ok(frame_count);
+            }
+        }
+    }
+
+    Err("Could not calculate frame count".into())
 }
+
 
 fn is_ffmpeg_installed() -> bool {
     Command::new("ffmpeg")

@@ -25,6 +25,10 @@ struct Args {
     #[arg(short = 'o', long)]
     output_dir: Option<String>,
 
+    /// Custom ffmpeg command (will substitute -i input and output.mkv automatically)
+    #[arg(short = 'f', long)]
+    ffmpeg_command: Option<String>,
+
     /// SVT-AV1 preset (0-13, lower is better quality but slower)
     #[arg(short, long, default_value = "8")]
     preset: u32,
@@ -37,6 +41,10 @@ struct Args {
     /// 0=vq, 1=psnr, 2=ssim
     #[arg(short = 't', long, default_value = "0")]
     tune: u32,
+
+    /// Film grain synthesis level (0-50, default: 0)
+    #[arg(short = 'g', long, default_value = "0")]
+    film_grain: u32,
 
     /// Video filter string (e.g., "scale=1920:1080")
     #[arg(short = 'v', long)]
@@ -208,12 +216,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .for_each(|video| {
             match convert_to_av1(
                 &video.path, 
-		args.output_dir.as_deref(),
+		        args.output_dir.as_deref(),
+                args.ffmpeg_command.as_deref(),
                 preset,
                 args.crf,
                 args.tune,
+                args.film_grain,
                 args.copy_audio,
-		args.audio_bitrate,
+		        args.audio_bitrate,
                 args.vf.as_deref(),
                 &pb, 
                 successful_frames.clone()
@@ -264,9 +274,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn convert_to_av1(
     input_path: &str,
     output_dir: Option<&str>,
+    ffmpeg_command: Option<&str>,
     preset: u32,
     crf: u32,
     tune: u32,
+    film_grain: u32,
     copy_audio: bool,
     audio_bitrate: Option<u32>,
     vf: Option<&str>,
@@ -280,6 +292,17 @@ fn convert_to_av1(
     };
     
     let mut cmd = Command::new("ffmpeg");
+
+    if let Some(custom_cmd) = ffmpeg_command {
+        // Parse the custom command, keeping -i input and output.mkv handling
+        cmd.arg("-i")
+            .arg(input_path)
+            .args(custom_cmd.split_whitespace())
+            .arg("-progress")
+            .arg("pipe:1")
+            .arg("-y")
+            .arg(&output_path);
+    } else {
     cmd.arg("-i")
         .arg(input_path)
         .arg("-map_metadata")  // Copy all metadata from input
@@ -291,8 +314,9 @@ fn convert_to_av1(
         .arg("-crf")
         .arg(crf.to_string())
         .arg("-svtav1-params")
-        .arg(format!("tune={}", tune));
-
+        .arg(format!("tune={}:film-grain={}", tune, film_grain))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     // Add video filter if specified
     if let Some(filter) = vf {
         cmd.arg("-vf").arg(filter);
@@ -312,7 +336,7 @@ fn convert_to_av1(
         .arg(&output_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-
+    }
     let mut process = cmd.spawn()?;
 
     let frame_regex = Regex::new(r"frame=\s*(\d+)")?;

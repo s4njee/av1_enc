@@ -150,25 +150,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Original files will be deleted after conversion");
     }
     let start_time = std::time::Instant::now();
-
-    // Collect all video files and their frame counts
-    println!("Scanning for MP4 files and counting frames...");
+println!("Scanning for MKV/MP4 files and counting frames...");
     let frame_scanning_pb = ProgressBar::new_spinner();
     frame_scanning_pb.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} Scanning: {msg} ({pos} files)").unwrap());
     frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let mp4_files: Vec<_> = WalkDir::new(&args.base_dir)
+    // First collect the files
+    let video_files: Vec<_> = WalkDir::new(&args.base_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path().extension()
-                .map(|ext| ext.to_ascii_lowercase() == "mp4")
+                .map(|ext| {
+                    let ext = ext.to_ascii_lowercase();
+                    ext == "mkv" || ext == "mp4"
+                })
                 .unwrap_or(false)
         })
         .collect();
 
-    let video_files: Vec<VideoInfo> = mp4_files.par_iter()
+    // Then process them into VideoInfo structs
+    let video_infos: Vec<VideoInfo> = video_files.par_iter()
         .filter_map(|entry| {
             frame_scanning_pb.inc(1);
             frame_scanning_pb.set_message(entry.path().display().to_string());
@@ -186,48 +189,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect();
 
-    frame_scanning_pb.finish_with_message(format!("Scanned {} files", video_files.len()));
+    frame_scanning_pb.finish_with_message(format!("Scanned {} files", video_infos.len()));
 
-    let total_files = video_files.len();
+    let total_files = video_infos.len();
     if total_files == 0 {
-        println!("No MP4 files found in directory: {}", args.base_dir);
+        println!("No MKV/MP4 files found in directory: {}", args.base_dir);
         return Ok(());
     }
 
-    let total_frames: usize = video_files.iter().map(|v| v.frame_count).sum();
+    let total_frames: usize = video_infos.iter().map(|v| v.frame_count).sum();
     println!("Found {} files with {} total frames to encode", total_files, total_frames);
 
-    // Setup progress bar for total frames
+    // Setup progress bar
     let pb = ProgressBar::new(total_frames as u64);
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames ({percent}%) {msg}")
         .unwrap()
         .progress_chars("#>-"));
 
+
     // Counters
     let successful_conversions = Arc::new(AtomicUsize::new(0));
     let successful_frames = Arc::new(AtomicUsize::new(0));
     let deleted_files = Arc::new(AtomicUsize::new(0));
-    let preset = args.preset;
     let should_delete = args.delete_originals;
 
+
     // Process files in parallel
-    video_files.par_iter()
+    video_infos.par_iter()
         .for_each(|video| {
-            match convert_to_av1(
-                &video.path, 
-		        args.output_dir.as_deref(),
-                args.ffmpeg_command.as_deref(),
-                preset,
-                args.crf,
-                args.tune,
-                args.film_grain,
-                args.copy_audio,
-		        args.audio_bitrate,
-                args.vf.as_deref(),
-                &pb, 
-                successful_frames.clone()
-            ) {
+         match convert_to_av1(
+	    &video.path, 
+	    args.output_dir.as_deref(),
+	    args.ffmpeg_command.as_deref(),
+	    args.preset,
+	    args.crf,
+	    args.tune,
+	    args.film_grain,
+	    args.vf.as_deref(),
+	    args.copy_audio,
+	    args.audio_bitrate,
+	    &pb,
+	    successful_frames.clone()
+	) { 
                 Ok(_) => {
                     successful_conversions.fetch_add(1, Ordering::Relaxed);
                     
@@ -279,9 +283,9 @@ fn convert_to_av1(
     crf: u32,
     tune: u32,
     film_grain: u32,
+    vf: Option<&str>,
     copy_audio: bool,
     audio_bitrate: Option<u32>,
-    vf: Option<&str>,
     pb: &ProgressBar,
     frame_counter: Arc<AtomicUsize>
 ) -> Result<(), Box<dyn Error>> {
@@ -368,6 +372,7 @@ fn convert_to_av1(
 }
 
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
+    // First attempt: Try getting nb_frames first (fastest when available)
     let output = Command::new("ffprobe")
         .arg("-v")
         .arg("error")
@@ -375,8 +380,9 @@ fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
         .arg("v:0")
         .arg("-show_entries")
         .arg("stream=duration,r_frame_rate")
-        .arg("-of")
+        .arg("-print_format")
         .arg("json")
+        .arg("-i")
         .arg(path)
         .output()?;
 
@@ -385,31 +391,85 @@ fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
     if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
         if let Some(stream) = streams.first() {
             // Get duration
-            let duration = stream.get("duration")
+            if let Some(duration) = stream.get("duration")
                 .and_then(|d| d.as_str())
-                .and_then(|d| d.parse::<f64>().ok())
-                .ok_or("Could not parse duration")?;
-
-            // Parse frame rate which comes as "num/den" string
-            let r_frame_rate = stream.get("r_frame_rate")
-                .and_then(|r| r.as_str())
-                .ok_or("Could not get frame rate")?;
-            
-            let parts: Vec<f64> = r_frame_rate.split('/')
-                .map(|p| p.parse::<f64>())
-                .collect::<Result<Vec<f64>, _>>()?;
-            
-            if parts.len() == 2 && parts[1] != 0.0 {
-                let fps = parts[0] / parts[1];
-                let frame_count = (duration * fps).round() as usize;
-                return Ok(frame_count);
+                .and_then(|d| d.parse::<f64>().ok()) {
+                
+                // Get frame rate
+                if let Some(r_frame_rate) = stream.get("r_frame_rate")
+                    .and_then(|r| r.as_str()) {
+                    
+                    let parts: Vec<f64> = r_frame_rate.split('/')
+                        .map(|p| p.parse::<f64>())
+                        .collect::<Result<Vec<f64>, _>>()?;
+                    
+                    if parts.len() == 2 && parts[1] != 0.0 {
+                        let fps = parts[0] / parts[1];
+                        let frame_count = (duration * fps).round() as usize;
+                        if frame_count > 0 {
+                            return Ok(frame_count);
+                        }
+                    }
+                }
             }
         }
     }
 
-    Err("Could not calculate frame count".into())
-}
+    // If we can't calculate from duration and frame rate, try container parameters
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-count_packets")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=nb_read_packets")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-i")
+        .arg(path)
+        .output()?;
 
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        if let Some(stream) = streams.first() {
+            if let Some(packets) = stream.get("nb_read_packets")
+                .and_then(|p| p.as_str())
+                .and_then(|p| p.parse::<usize>().ok()) {
+                if packets > 0 {
+                    return Ok(packets);
+                }
+            }
+        }
+    }
+
+    // If all else fails, estimate based on video duration and container frame rate
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-i")
+        .arg(path)
+        .output()?;
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if let Some(duration) = json.get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+        .and_then(|d| d.parse::<f64>().ok()) {
+        // Assume common frame rate if we can't get it otherwise
+        let estimated_frames = (duration * 24.0).round() as usize;
+        if estimated_frames > 0 {
+            return Ok(estimated_frames);
+        }
+    }
+
+    Err("Could not determine frame count".into())
+}
 
 fn is_ffmpeg_installed() -> bool {
     Command::new("ffmpeg")

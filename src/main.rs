@@ -65,11 +65,61 @@ struct Args {
     /// Delete original files after successful conversion
     #[arg(short = 'd', long)]
     delete_originals: bool,
+
+    #[arg(short = 'y', long)]
+    force_yes: bool,
 }
 
 struct VideoInfo {
     path: String,
     frame_count: usize,
+}
+
+// Add helper function:
+fn check_overwrites(
+    video_infos: &[VideoInfo], 
+    output_dir: Option<&str>, 
+    delete_originals: bool
+) -> Vec<PathBuf> {
+    if delete_originals {
+        return Vec::new(); // No overwrite checks needed if we're deleting originals
+    }
+
+    video_infos.iter()
+        .filter_map(|video| {
+            let input_path = Path::new(&video.path);
+            let input_stem = input_path.file_stem().unwrap();
+            
+            let final_filename = if input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("mkv")) {
+                input_path.file_name().unwrap().to_string_lossy().to_string()
+            } else {
+                format!("{}.mkv", input_stem.to_string_lossy())
+            };
+            
+            let final_path = match output_dir {
+                Some(dir) => Path::new(dir).join(&final_filename),
+                None => input_path.with_file_name(&final_filename),
+            };
+
+            if final_path.exists() {
+                Some(final_path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn prompt_yes_no(question: &str) -> bool {
+    print!("{} [y/N] ", question);
+    std::io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        input.trim().eq_ignore_ascii_case("y")
+    } else {
+        false
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -150,7 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Original files will be deleted after conversion");
     }
     let start_time = std::time::Instant::now();
-println!("Scanning for MKV/MP4 files and counting frames...");
+    println!("Scanning for MKV/MP4 files and counting frames...");
     let frame_scanning_pb = ProgressBar::new_spinner();
     frame_scanning_pb.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} Scanning: {msg} ({pos} files)").unwrap());
@@ -199,6 +249,23 @@ println!("Scanning for MKV/MP4 files and counting frames...");
 
     let total_frames: usize = video_infos.iter().map(|v| v.frame_count).sum();
     println!("Found {} files with {} total frames to encode", total_files, total_frames);
+
+    // Check for potential overwrites before starting
+    let overwrites = check_overwrites(&video_infos, args.output_dir.as_deref(), args.delete_originals);
+    if !overwrites.is_empty() && !args.force_yes {
+        println!("\nThe following files would be overwritten:");
+        for path in &overwrites {
+            println!("  {}", path.display());
+        }
+        println!();
+        
+        if !prompt_yes_no("Do you want to continue and overwrite these files?") {
+            println!("Aborting.");
+            std::process::exit(0);
+        }
+    }
+
+    println!("\nStarting AV1 encoding...");
 
     // Setup progress bar
     let pb = ProgressBar::new(total_frames as u64);
@@ -290,9 +357,13 @@ fn convert_to_av1(
     frame_counter: Arc<AtomicUsize>
 ) -> Result<(), Box<dyn Error>> {
     let input_path = Path::new(input_path);
-    let output_path = match output_dir {
-        Some(dir) => Path::new(dir).join(input_path.file_name().unwrap()).with_extension("mkv"),
-        None => input_path.with_extension("mkv"),
+    let input_stem = input_path.file_stem().unwrap().to_string_lossy();
+    
+    // Always encode to a temporary file first
+    let temp_filename = format!("{}-temp-{}.mkv", input_stem, std::process::id());
+    let temp_path = match output_dir {
+        Some(dir) => Path::new(dir).join(&temp_filename),
+        None => input_path.with_file_name(&temp_filename),
     };
     
     let mut cmd = Command::new("ffmpeg");
@@ -305,44 +376,46 @@ fn convert_to_av1(
             .arg("-progress")
             .arg("pipe:1")
             .arg("-y")
-            .arg(&output_path)
+            .arg(&temp_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
     } else {
-    cmd.arg("-i")
-        .arg(input_path)
-        .arg("-map_metadata")  // Copy all metadata from input
-        .arg("0")
-        .arg("-c:v")
-        .arg("libsvtav1")
-        .arg("-preset")
-        .arg(preset.to_string())
-        .arg("-crf")
-        .arg(crf.to_string())
-        .arg("-svtav1-params")
-        .arg(format!("tune={}:film-grain={}", tune, film_grain))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // Add video filter if specified
-    if let Some(filter) = vf {
-        cmd.arg("-vf").arg(filter);
-    }
-    if copy_audio {
-        cmd.arg("-c:a").arg("copy");
-    } else {
-        cmd.arg("-c:a").arg("libopus");
-        if let Some(bitrate) = audio_bitrate {
-            cmd.arg("-b:a").arg(format!("{}k", bitrate));
+        cmd.arg("-i")
+            .arg(input_path)
+            .arg("-map_metadata")  // Copy all metadata from input
+            .arg("0")
+            .arg("-c:v")
+            .arg("libsvtav1")
+            .arg("-preset")
+            .arg(preset.to_string())
+            .arg("-crf")
+            .arg(crf.to_string())
+            .arg("-svtav1-params")
+            .arg(format!("tune={}:film-grain={}", tune, film_grain))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        // Add video filter if specified
+        if let Some(filter) = vf {
+            cmd.arg("-vf").arg(filter);
         }
-    }
+        if copy_audio {
+            cmd.arg("-c:a").arg("copy");
+        } else {
+            cmd.arg("-c:a").arg("libopus");
+            if let Some(bitrate) = audio_bitrate {
+                cmd.arg("-b:a").arg(format!("{}k", bitrate));
+            }
+        }
 
         cmd.arg("-progress")
-        .arg("pipe:1")
-        .arg("-y")
-        .arg(&output_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+            .arg("pipe:1")
+            .arg("-y")
+            .arg(&temp_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
     }
+
     let mut process = cmd.spawn()?;
 
     let frame_regex = Regex::new(r"frame=\s*(\d+)")?;
@@ -367,12 +440,31 @@ fn convert_to_av1(
 
     let status = process.wait()?;
     if !status.success() {
+        // Clean up temp file if encoding failed
+        let _ = fs::remove_file(&temp_path);
         return Err("FFmpeg encoding failed".into());
     }
 
+    // Determine final path
+    let final_filename = if input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("mkv")) {
+        input_path.file_name().unwrap().to_string_lossy().to_string()
+    } else {
+        format!("{}.mkv", input_stem)
+    };
+    
+    let final_path = match output_dir {
+        Some(dir) => Path::new(dir).join(&final_filename),
+        None => input_path.with_file_name(&final_filename),
+    };
+
+    // If we're replacing the original file, we can safely rename now
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
+    }
+    fs::rename(&temp_path, &final_path)?;
+
     Ok(())
 }
-
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
     let output = Command::new("ffprobe")
         .arg("-v")

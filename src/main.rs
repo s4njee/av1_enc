@@ -305,7 +305,9 @@ fn convert_to_av1(
             .arg("-progress")
             .arg("pipe:1")
             .arg("-y")
-            .arg(&output_path);
+            .arg(&output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
     } else {
     cmd.arg("-i")
         .arg(input_path)
@@ -372,45 +374,46 @@ fn convert_to_av1(
 }
 
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
-    // First attempt: Try getting nb_frames first (fastest when available)
     let output = Command::new("ffprobe")
         .arg("-v")
         .arg("error")
         .arg("-select_streams")
         .arg("v:0")
         .arg("-show_entries")
-        .arg("stream=duration,r_frame_rate")
-        .arg("-print_format")
+        .arg("format=duration")
+        .arg("-show_entries")
+        .arg("stream=r_frame_rate")
+        .arg("-of")
         .arg("json")
-        .arg("-i")
         .arg(path)
         .output()?;
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     
+    // Get duration from format section
+    let duration = json
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+        .ok_or("Missing duration field")?
+        .parse::<f64>()?;
+
     if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
         if let Some(stream) = streams.first() {
-            // Get duration
-            if let Some(duration) = stream.get("duration")
-                .and_then(|d| d.as_str())
-                .and_then(|d| d.parse::<f64>().ok()) {
-                
-                // Get frame rate
-                if let Some(r_frame_rate) = stream.get("r_frame_rate")
-                    .and_then(|r| r.as_str()) {
-                    
-                    let parts: Vec<f64> = r_frame_rate.split('/')
-                        .map(|p| p.parse::<f64>())
-                        .collect::<Result<Vec<f64>, _>>()?;
-                    
-                    if parts.len() == 2 && parts[1] != 0.0 {
-                        let fps = parts[0] / parts[1];
-                        let frame_count = (duration * fps).round() as usize;
-                        if frame_count > 0 {
-                            return Ok(frame_count);
-                        }
-                    }
-                }
+
+            // Parse frame rate which comes as "num/den" string
+            let r_frame_rate = stream.get("r_frame_rate")
+                .and_then(|r| r.as_str())
+                .ok_or("Could not get frame rate")?;
+            
+            let parts: Vec<f64> = r_frame_rate.split('/')
+                .map(|p| p.parse::<f64>())
+                .collect::<Result<Vec<f64>, _>>()?;
+            
+            if parts.len() == 2 && parts[1] != 0.0 {
+                let fps = parts[0] / parts[1];
+                let frame_count = (duration * fps).round() as usize;
+                return Ok(frame_count);
             }
         }
     }

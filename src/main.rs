@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 use std::error::Error;
@@ -10,8 +10,9 @@ use clap::Parser;
 use rayon::ThreadPoolBuilder;
 use num_cpus;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use regex::Regex;
+
 
 #[derive(Parser)]
 #[command(name = "av1_enc")]

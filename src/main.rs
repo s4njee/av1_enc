@@ -161,12 +161,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let start_time = std::time::Instant::now();
     println!("Scanning for MKV/MP4 files and counting frames...");
-    let frame_scanning_pb = ProgressBar::new_spinner();
-    frame_scanning_pb.set_style(ProgressStyle::default_spinner()
-        .template("{spinner:.green} Scanning: {msg} ({pos} files)").unwrap());
-    frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-
     let (video_infos, total_frames, total_files) = scan_video_files(&args.base_dir, &args.extensions)?;
     
     if video_infos.is_empty() {

@@ -521,7 +521,9 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
     let mut total_frames = 0;
     let mut video_infos = Vec::new();
     let mut total_files = 0;
+    let mut failed_files = 0;
     
+    // Convert all extensions to lowercase once
     let extensions: Vec<String> = extensions.iter()
         .map(|ext| ext.trim().to_lowercase())
         .collect();
@@ -540,10 +542,12 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
                             total_frames += frame_count;
                             video_infos.push(VideoInfo {
                                 path: entry.path().to_string_lossy().into_owned(),
+                                frame_count,
                             });
                         }
                         Err(e) => {
-                            eprintln!("Warning: Failed to get frame count for {}: {}", entry.path().display(), e);
+                            failed_files += 1;
+                            eprintln!("Skipping {}: ffprobe failed: {}", entry.path().display(), e);
                             continue;
                         }
                     }
@@ -552,10 +556,14 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
         }
     }
 
-    frame_scanning_pb.finish_with_message(format!("Scanned {} files", total_files));
+    frame_scanning_pb.finish_with_message(format!(
+        "Scanned {} files ({} skipped due to ffprobe failures)", 
+        total_files,
+        failed_files
+    ));
+    
     Ok((video_infos, total_frames, total_files))
 }
-
 
 fn prompt_yes_no(question: &str) -> bool {
     print!("{} [y/N] ", question);

@@ -518,9 +518,9 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
         .unwrap());
     frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let mut total_frames = 0;
     let mut video_infos = Vec::new();
     let mut total_files = 0;
+    let mut total_frames = 0;
     let mut failed_files = 0;
     
     // Convert all extensions to lowercase once
@@ -542,7 +542,6 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
                             total_frames += frame_count;
                             video_infos.push(VideoInfo {
                                 path: entry.path().to_string_lossy().into_owned(),
-                                frame_count,
                             });
                         }
                         Err(e) => {

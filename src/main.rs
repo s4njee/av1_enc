@@ -22,6 +22,9 @@ struct Args {
     #[arg(default_value = ".")]
     base_dir: String,
 
+    #[arg(short = 'e', long, value_delimiter = ',', default_value = "mp4")]
+    extensions: Vec<String>,
+
     /// Output directory (will be created if it doesn't exist)
     #[arg(short = 'o', long)]
     output_dir: Option<String>,
@@ -73,7 +76,6 @@ struct Args {
 
 struct VideoInfo {
     path: String,
-    frame_count: usize,
 }
 
 // Add helper function:
@@ -111,54 +113,10 @@ fn check_overwrites(
         .collect()
 }
 
-fn prompt_yes_no(question: &str) -> bool {
-    print!("{} [y/N] ", question);
-    std::io::stdout().flush().unwrap();
-    
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_ok() {
-        input.trim().eq_ignore_ascii_case("y")
-    } else {
-        false
-    }
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-
-    // Validate preset range
-    if args.preset > 13 {
-        eprintln!("Error: Preset must be between 0 and 13");
-        std::process::exit(1);
-    }
-
-    // Validate CRF range
-    if args.crf > 63 {
-        eprintln!("Error: CRF must be between 0 and 63");
-        std::process::exit(1);
-    }
-
-    // Validate tune range
-    if args.tune > 2 {
-        eprintln!("Error: Tune must be between 0 and 2");
-        std::process::exit(1);
-    }
-
-    // Validate thread count
-    if args.threads < 1 {
-        eprintln!("Error: Thread count must be at least 1");
-        std::process::exit(1);
-    }
-
-    // Check dependencies
-    if !is_ffmpeg_installed() {
-        eprintln!("Error: ffmpeg is not installed. Please install it first.");
-        std::process::exit(1);
-    }
-    if !is_ffprobe_installed() {
-        eprintln!("Error: ffprobe is not installed. Please install it first.");
-        std::process::exit(1);
-    }
+    validate_arguments(&args)?;
 
     // Configure thread pool
     ThreadPoolBuilder::new()
@@ -180,6 +138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting AV1 encoding...");
     println!("Base directory: {}", args.base_dir);
+    println!("File extensions: {}", args.extensions.join(", "));
     println!("SVT-AV1 preset: {}", args.preset);
     println!("CRF: {}", args.crf);
     println!("Tune: {} ({})", args.tune, match args.tune {
@@ -207,49 +166,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .template("{spinner:.green} Scanning: {msg} ({pos} files)").unwrap());
     frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // First collect the files
-    let video_files: Vec<_> = WalkDir::new(&args.base_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension()
-                .map(|ext| {
-                    let ext = ext.to_ascii_lowercase();
-                    ext == "mkv" || ext == "mp4"
-                })
-                .unwrap_or(false)
-        })
-        .collect();
 
-    // Then process them into VideoInfo structs
-    let video_infos: Vec<VideoInfo> = video_files.par_iter()
-        .filter_map(|entry| {
-            frame_scanning_pb.inc(1);
-            frame_scanning_pb.set_message(entry.path().display().to_string());
-            
-            match get_frame_count(entry.path()) {
-                Ok(frame_count) => Some(VideoInfo {
-                    path: entry.path().to_string_lossy().into_owned(),
-                    frame_count,
-                }),
-                Err(e) => {
-                    eprintln!("Failed to get frame count for {}: {}", entry.path().display(), e);
-                    None
-                }
-            }
-        })
-        .collect();
-
-    frame_scanning_pb.finish_with_message(format!("Scanned {} files", video_infos.len()));
-
-    let total_files = video_infos.len();
-    if total_files == 0 {
-        println!("No MKV/MP4 files found in directory: {}", args.base_dir);
+    let (video_infos, total_frames, total_files) = scan_video_files(&args.base_dir, &args.extensions)?;
+    
+    if video_infos.is_empty() {
+        println!("No matching files found in directory: {}", args.base_dir);
         return Ok(());
     }
 
-    let total_frames: usize = video_infos.iter().map(|v| v.frame_count).sum();
-    println!("Found {} files with {} total frames to encode", total_files, total_frames);
+    println!("Found {} total files ({} successfully scanned) with {} total frames to encode", 
+             total_files, video_infos.len(), total_frames);
+
 
     // Check for potential overwrites before starting
     let overwrites = check_overwrites(&video_infos, args.output_dir.as_deref(), args.delete_originals);
@@ -581,4 +508,91 @@ fn is_ffprobe_installed() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+
+fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoInfo>, usize, usize), Box<dyn Error>> {
+    let frame_scanning_pb = ProgressBar::new_spinner();
+    frame_scanning_pb.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} Scanning: {msg} ({pos} files)")
+        .unwrap());
+    frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let mut total_frames = 0;
+    let mut video_infos = Vec::new();
+    let mut total_files = 0;
+    
+    let extensions: Vec<String> = extensions.iter()
+        .map(|ext| ext.trim().to_lowercase())
+        .collect();
+
+    for entry in WalkDir::new(base_dir) {
+        if let Ok(entry) = entry {
+            if let Some(ext) = entry.path().extension() {
+                let ext_lower = ext.to_string_lossy().to_lowercase();
+                if extensions.contains(&ext_lower) {
+                    total_files += 1;
+                    frame_scanning_pb.inc(1);
+                    frame_scanning_pb.set_message(entry.path().display().to_string());
+
+                    match get_frame_count(entry.path()) {
+                        Ok(frame_count) => {
+                            total_frames += frame_count;
+                            video_infos.push(VideoInfo {
+                                path: entry.path().to_string_lossy().into_owned(),
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Failed to get frame count for {}: {}", entry.path().display(), e);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    frame_scanning_pb.finish_with_message(format!("Scanned {} files", total_files));
+    Ok((video_infos, total_frames, total_files))
+}
+
+
+fn prompt_yes_no(question: &str) -> bool {
+    print!("{} [y/N] ", question);
+    std::io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        input.trim().eq_ignore_ascii_case("y")
+    } else {
+        false
+    }
+}
+
+fn validate_arguments(args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.preset > 13 {
+        return Err("Preset must be between 0 and 13".into());
+    }
+    if args.crf > 63 {
+        return Err("CRF must be between 0 and 63".into());
+    }
+    if args.tune > 2 {
+        return Err("Tune must be between 0 and 2".into());
+    }
+    if args.threads < 1 {
+        return Err("Thread count must be at least 1".into());
+    }
+    if !is_ffmpeg_installed() {
+        return Err("ffmpeg is not installed".into());
+    }
+    if !is_ffprobe_installed() {
+        return Err("ffprobe is not installed".into());
+    }
+    if !Path::new(&args.base_dir).exists() {
+        return Err(format!("Directory '{}' does not exist", args.base_dir).into());
+    }
+    if args.extensions.is_empty() {
+        return Err("At least one file extension must be specified".into());
+    }
+    Ok(())
 }

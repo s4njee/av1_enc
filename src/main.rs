@@ -12,7 +12,51 @@ use num_cpus;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use regex::Regex;
+use std::sync::Mutex;
+use std::collections::HashSet;
 
+// Add a new struct to handle logging
+struct CompletedFiles {
+    log_path: PathBuf,
+    completed: HashSet<String>,
+    file_handle: Mutex<fs::File>,
+}
+
+impl CompletedFiles {
+    fn new(base_dir: &str) -> Result<Self, Box<dyn Error>> {
+        let log_path = Path::new(base_dir).join("completed_encodes.log");
+        let mut completed = HashSet::new();
+        
+        // Read existing log if it exists
+        if log_path.exists() {
+            let contents = fs::read_to_string(&log_path)?;
+            completed = contents.lines().map(String::from).collect();
+        }
+        
+        // Open file in append mode
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+            
+        Ok(CompletedFiles {
+            log_path,
+            completed,
+            file_handle: Mutex::new(file),
+        })
+    }
+    
+    fn is_completed(&self, path: &str) -> bool {
+        self.completed.contains(path)
+    }
+    
+    fn mark_completed(&self, path: &str) -> Result<(), Box<dyn Error>> {
+        let mut file = self.file_handle.lock().unwrap();
+        writeln!(file, "{}", path)?;
+        file.flush()?;
+        Ok(())
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "av1_enc")]
@@ -72,6 +116,9 @@ struct Args {
 
     #[arg(short = 'y', long)]
     force_yes: bool,
+
+    #[arg(long)]
+    no_log: bool,
 }
 
 struct VideoInfo {
@@ -117,6 +164,13 @@ fn check_overwrites(
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     validate_arguments(&args)?;
+
+    // Initialize logging
+    let completed_files = if !args.no_log {
+        Some(Arc::new(CompletedFiles::new(&args.base_dir)?))
+    } else {
+        None
+    };
 
     // Configure thread pool
     ThreadPoolBuilder::new()
@@ -207,6 +261,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Process files in parallel
     video_infos.par_iter()
         .for_each(|video| {
+
+
+        // Skip if already completed
+        if let Some(ref completed) = completed_files {
+            if completed.is_completed(&video.path) {
+                pb.println(format!("Skipping already encoded file: {}", video.path));
+                return;
+            }
+        }
+
+        // else encode
          match convert_to_av1(
 	    &video.path, 
 	    args.output_dir.as_deref(),
@@ -223,7 +288,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 	) { 
                 Ok(_) => {
                     successful_conversions.fetch_add(1, Ordering::Relaxed);
-                    
+
+                    // Log successful conversion
+                    if let Some(ref completed) = completed_files {
+                        if let Err(e) = completed.mark_completed(&video.path) {
+                            eprintln!("Failed to log completed file {}: {}", video.path, e);
+                        }
+                    }
+
+
                     if should_delete {
                         match fs::remove_file(&video.path) {
                             Ok(_) => {

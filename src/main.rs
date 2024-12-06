@@ -288,29 +288,48 @@ fn main() -> Result<(), Box<dyn Error>> {
 	) { 
                 Ok(_) => {
                     successful_conversions.fetch_add(1, Ordering::Relaxed);
-
-                    // Log successful conversion
-                    if let Some(ref completed) = completed_files {
-                        if let Err(e) = completed.mark_completed(&video.path) {
-                            eprintln!("Failed to log completed file {}: {}", video.path, e);
-                        }
-                    }
-
-
-                    if should_delete {
-                        match fs::remove_file(&video.path) {
-                            Ok(_) => {
-                                deleted_files.fetch_add(1, Ordering::Relaxed);
-                                pb.set_message(format!("Converted and deleted: {}", video.path));
-                            },
-                            Err(e) => {
-                                eprintln!("Failed to delete {}: {}", video.path, e);
-                                pb.set_message(format!("Converted (delete failed): {}", video.path));
+                    // Log successful conversion and handle deletion
+                    match &completed_files {
+                        Some(completed) => {
+                            if let Err(e) = completed.mark_completed(&video.path) {
+                                eprintln!("Failed to log completed file {}: {}", video.path, e);
+                            }
+                            
+                            // Only delete if the file isn't already in the completed log
+                            if should_delete && !completed.is_completed(&video.path) {
+                                match fs::remove_file(&video.path) {
+                                    Ok(_) => {
+                                        deleted_files.fetch_add(1, Ordering::Relaxed);
+                                        pb.set_message(format!("Converted and deleted: {}", video.path));
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Failed to delete {}: {}", video.path, e);
+                                        pb.set_message(format!("Converted (delete failed): {}", video.path));
+                                    }
+                                }
+                            } else {
+                                pb.set_message(format!("Converted: {}", video.path));
+                            }
+                        },
+                        None => {
+                            // No logging enabled, proceed with normal deletion
+                            if should_delete {
+                                match fs::remove_file(&video.path) {
+                                    Ok(_) => {
+                                        deleted_files.fetch_add(1, Ordering::Relaxed);
+                                        pb.set_message(format!("Converted and deleted: {}", video.path));
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Failed to delete {}: {}", video.path, e);
+                                        pb.set_message(format!("Converted (delete failed): {}", video.path));
+                                    }
+                                }
+                            } else {
+                                pb.set_message(format!("Converted: {}", video.path));
                             }
                         }
-                    } else {
-                        pb.set_message(format!("Converted: {}", video.path));
                     }
+                
                 },
                 Err(e) => {
                     eprintln!("Failed to convert {}: {}", video.path, e);
@@ -360,6 +379,8 @@ fn convert_to_av1(
         Some(dir) => Path::new(dir).join(&temp_filename),
         None => input_path.with_file_name(&temp_filename),
     };
+
+    let audio_channels = get_audio_channels(input_path)?;
     
     let mut cmd = Command::new("ffmpeg");
 
@@ -398,9 +419,33 @@ fn convert_to_av1(
             cmd.arg("-c:a").arg("copy");
         } else {
             cmd.arg("-c:a").arg("libopus");
-            if let Some(bitrate) = audio_bitrate {
-                cmd.arg("-b:a").arg(format!("{}k", bitrate));
-            }
+            
+            // Set appropriate audio parameters based on channel count
+            match audio_channels {
+                1 => {
+                    // Mono
+                    cmd.arg("-ac").arg("1")
+                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(64)));
+                },
+                2 => {
+                    // Stereo
+                    cmd.arg("-ac").arg("2")
+                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(96)));
+                },
+                channels if channels >= 6 => {
+                    // 5.1 or higher
+                    cmd.arg("-ac").arg("6")
+                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(384)))
+                       .arg("-mapping_family").arg("1")  // Important for multichannel Opus
+                       .arg("-apply_phase_inv").arg("0")
+                       .arg("-channel_layout").arg("5.1");
+                },
+                _ => {
+                    // Default to stereo for other configurations
+                    cmd.arg("-ac").arg("2")
+                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(96)));
+                },
+            }   
         }
 
         cmd.arg("-progress")
@@ -641,6 +686,33 @@ fn prompt_yes_no(question: &str) -> bool {
     } else {
         false
     }
+}
+
+fn get_audio_channels(path: &Path) -> Result<u32, Box<dyn Error>> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")  // Select first audio stream
+        .arg("-show_entries")
+        .arg("stream=channels")
+        .arg("-of")
+        .arg("json")
+        .arg(path)
+        .output()?;
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        if let Some(stream) = streams.first() {
+            if let Some(channels) = stream.get("channels").and_then(|c| c.as_u64()) {
+                return Ok(channels as u32);
+            }
+        }
+    }
+
+    // Default to stereo if we can't determine
+    Ok(2)
 }
 
 fn validate_arguments(args: &Args) -> Result<(), Box<dyn Error>> {

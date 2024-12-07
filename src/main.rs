@@ -342,9 +342,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 	    args.crf,
 	    args.tune,
 	    args.film_grain,
+        args.anime,
 	    args.vf.as_deref(),
 	    args.copy_audio,
 	    args.audio_bitrate,
+        completed_files,
 	    &pb,
 	    successful_frames.clone()
 	) { 
@@ -422,6 +424,7 @@ fn convert_to_av1(
     crf: u32,
     tune: u32,
     film_grain: u32,
+    anime: bool,
     vf: Option<&str>,
     copy_audio: bool,
     audio_bitrate: Option<u32>,
@@ -478,7 +481,7 @@ fn convert_to_av1(
             .arg("-crf")
             .arg(crf.to_string())
             .arg("-svtav1-params")
-            .arg(svtav1_params);
+            .arg(svtav1_params)
             .arg("-pix_fmt")
             .arg("yuv420p10le")
             .arg("-c:s")

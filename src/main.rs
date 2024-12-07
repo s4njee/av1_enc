@@ -350,57 +350,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 	    &pb,
 	    successful_frames.clone()
 	) { 
-                Ok(_) => {
-                    successful_conversions.fetch_add(1, Ordering::Relaxed);
-                    // Log successful conversion and handle deletion
-                    match &completed_files {
-                        Some(completed) => {
-                            // Only delete if the file is already in the completed log
-                            if should_delete && completed.is_completed(&video.path) {
-                                let is_mkv = Path::new(&video.path)
-                                .extension()
-                                .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
-                            
-                                if !is_mkv {
-                                    match fs::remove_file(&video.path) {
-                                        Ok(_) => {
-                                            deleted_files.fetch_add(1, Ordering::Relaxed);
-                                            pb.set_message(format!("Converted and deleted: {}", video.path));
-                                        },
-                                        Err(e) => {
-                                            eprintln!("Failed to delete {}: {}", video.path, e);
-                                            pb.set_message(format!("Converted (delete failed): {}", video.path));
-                                        }
-                                    }
-                                } else {
-                                    pb.set_message(format!("Converted: {}", video.path));
-                                }
-                        }
-                    },
-                        None => {
-                            // No logging enabled, proceed with normal deletion
-                            if should_delete {
-                                match fs::remove_file(&video.path) {
-                                    Ok(_) => {
-                                        deleted_files.fetch_add(1, Ordering::Relaxed);
-                                        pb.set_message(format!("Converted and deleted: {}", video.path));
-                                    },
-                                    Err(e) => {
-                                        eprintln!("Failed to delete {}: {}", video.path, e);
-                                        pb.set_message(format!("Converted (delete failed): {}", video.path));
-                                    }
-                                }
-                            } else {
-                                pb.set_message(format!("Converted: {}", video.path));
+        Ok(_) => {
+            successful_conversions.fetch_add(1, Ordering::Relaxed);
+            
+            if let Some(ref completed) = completed_files {
+                if should_delete && completed.is_completed(&video.path) {
+                    let is_mkv = Path::new(&video.path)
+                        .extension()
+                        .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
+                    
+                    if !is_mkv {
+                        match fs::remove_file(&video.path) {
+                            Ok(_) => {
+                                deleted_files.fetch_add(1, Ordering::Relaxed);
+                                pb.set_message(format!("Converted and deleted: {}", video.path));
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to delete {}: {}", video.path, e);
+                                pb.set_message(format!("Converted (delete failed): {}", video.path));
                             }
                         }
+                    } else {
+                        pb.set_message(format!("Converted: {}", video.path));
                     }
-                
-                },
-                Err(e) => {
-                    eprintln!("Failed to convert {}: {}", video.path, e);
+                } else {
+                    pb.set_message(format!("Converted: {}", video.path));
                 }
+            } else {
+                pb.set_message(format!("Converted: {}", video.path));
             }
+        },
+        Err(e) => {
+            eprintln!("Failed to convert {}: {}", video.path, e);
+        }
+    } 
         });
     pb.finish_with_message("Encoding complete!");
 
@@ -605,7 +588,10 @@ fn convert_to_av1(
             eprintln!("Failed to log completed file {}: {}", &input_path.to_string_lossy(), e);
         }
     }
+
+    
     Ok(())
+    
 }
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
     let output = Command::new("ffprobe")

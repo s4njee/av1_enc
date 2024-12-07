@@ -595,8 +595,8 @@ fn convert_to_av1(
     fs::rename(&temp_path, &final_path)?;
     
     if let Some(completed) = completed_files {
-        if let Err(e) = completed.mark_completed(&final_path) {
-            eprintln!("Failed to log completed file {}: {}", video.path, e);
+        if let Err(e) = completed.mark_completed(input_path) {
+            eprintln!("Failed to log completed file {}: {}", input_path, e);
         }
     }
     Ok(())

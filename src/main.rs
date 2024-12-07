@@ -355,7 +355,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // Log successful conversion and handle deletion
                     match &completed_files {
                         Some(completed) => {
-                            // Only delete if the file isn't already in the completed log
+                            // Only delete if the file is already in the completed log
                             if should_delete && completed.is_completed(&video.path) {
                                 let is_mkv = Path::new(&video.path)
                                 .extension()
@@ -375,7 +375,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 } else {
                                     pb.set_message(format!("Converted: {}", video.path));
                                 }
-                        },
+                        }
+                    },
                         None => {
                             // No logging enabled, proceed with normal deletion
                             if should_delete {

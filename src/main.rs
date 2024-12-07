@@ -348,47 +348,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 	    args.audio_bitrate,
         completed_files.clone(),
 	    &pb,
-	    successful_frames.clone()
+	    successful_frames.clone(),
+        should_delete,
+        deleted_files.clone()
 	){ 
         Ok(_) => {
             successful_conversions.fetch_add(1, Ordering::Relaxed);
-            
-            if should_delete {
-                let is_mkv = Path::new(&video.path)
-                    .extension()
-                    .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
-                
-                if !is_mkv {
-                    // Only check completion if logging is enabled
-                    let can_delete = if let Some(ref completed) = completed_files {
-                        // Give a small delay to ensure the completion is written
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        completed.is_completed(&video.path)
-                    } else {
-                        // If no logging, we can delete right away
-                        true
-                    };
-    
-                    if can_delete {
-                        match fs::remove_file(&video.path) {
-                            Ok(_) => {
-                                deleted_files.fetch_add(1, Ordering::Relaxed);
-                                pb.set_message(format!("Converted and deleted: {}", video.path));
-                            },
-                            Err(e) => {
-                                eprintln!("Failed to delete {}: {}", video.path, e);
-                                pb.set_message(format!("Converted (delete failed): {}", video.path));
-                            }
-                        }
-                    } else {
-                        pb.set_message(format!("Converted (not marked as completed in log): {}", video.path));
-                    }
-                } else {
-                    pb.set_message(format!("Converted (skipping MKV delete): {}", video.path));
-                }
-            } else {
-                pb.set_message(format!("Converted: {}", video.path));
-            }
         },
         Err(e) => {
             eprintln!("Failed to convert {}: {}", video.path, e);
@@ -429,7 +394,9 @@ fn convert_to_av1(
     audio_bitrate: Option<u32>,
     completed_files: Option<Arc<CompletedFiles>>,
     pb: &ProgressBar,
-    frame_counter: Arc<AtomicUsize>
+    frame_counter: Arc<AtomicUsize>,
+    should_delete: bool,
+    deleted_files: Arc<AtomicUsize>
 ) -> Result<(), Box<dyn Error>> {
     let input_path = Path::new(input_path);
     let input_stem = input_path.file_stem().unwrap().to_string_lossy();
@@ -598,6 +565,55 @@ fn convert_to_av1(
             eprintln!("Failed to log completed file {}: {}", &input_path.to_string_lossy(), e);
         }
     }
+
+        // After successful encoding and file renaming
+        if let Some(completed) = completed_files {
+            let input_path_str = input_path.to_string_lossy();
+            if let Err(e) = completed.mark_completed(&input_path_str) {
+                eprintln!("Failed to log completed file {}: {}", &input_path_str, e);
+            } else {
+                pb.println(format!("Successfully completed encoding: {}", input_path_str));
+            }
+        }
+    
+        // Handle deletion if needed
+        if should_delete {
+            let is_mkv = input_path
+                .extension()
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
+            
+            if !is_mkv {
+                // Only check completion if logging is enabled
+                let can_delete = if let Some(ref completed) = completed_files {
+                    // Give a small delay to ensure the completion is written
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    completed.is_completed(&input_path.to_string_lossy())
+                } else {
+                    // If no logging, we can delete right away
+                    true
+                };
+    
+                if can_delete {
+                    match fs::remove_file(input_path) {
+                        Ok(_) => {
+                            deleted_files.fetch_add(1, Ordering::Relaxed);
+                            pb.set_message(format!("Converted and deleted: {}", input_path.display()));
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to delete {}: {}", input_path.display(), e);
+                            pb.set_message(format!("Converted (delete failed): {}", input_path.display()));
+                        }
+                    }
+                } else {
+                    pb.set_message(format!("Converted (not marked as completed in log): {}", input_path.display()));
+                }
+            } else {
+                pb.set_message(format!("Converted (skipping MKV delete): {}", input_path.display()));
+            }
+        } else {
+            pb.set_message(format!("Converted: {}", input_path.display()));
+        }
+    
 
     
     Ok(())

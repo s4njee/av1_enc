@@ -593,6 +593,7 @@ fn convert_to_av1(
     if let Some(completed) = completed_files {
         if let Err(e) = completed.mark_completed(&final_path) {
             eprintln!("Failed to log completed file {}: {}", video.path, e);
+        }
     }
     Ok(())
 }

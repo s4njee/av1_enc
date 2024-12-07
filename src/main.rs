@@ -349,17 +349,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         completed_files.clone(),
 	    &pb,
 	    successful_frames.clone()
-	) { 
+	){ 
         Ok(_) => {
             successful_conversions.fetch_add(1, Ordering::Relaxed);
             
-            if let Some(ref completed) = completed_files {
-                if should_delete && completed.is_completed(&video.path) {
-                    let is_mkv = Path::new(&video.path)
-                        .extension()
-                        .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
-                    
-                    if !is_mkv {
+            if should_delete {
+                let is_mkv = Path::new(&video.path)
+                    .extension()
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
+                
+                if !is_mkv {
+                    // Only check completion if logging is enabled
+                    let can_delete = if let Some(ref completed) = completed_files {
+                        // Give a small delay to ensure the completion is written
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        completed.is_completed(&video.path)
+                    } else {
+                        // If no logging, we can delete right away
+                        true
+                    };
+    
+                    if can_delete {
                         match fs::remove_file(&video.path) {
                             Ok(_) => {
                                 deleted_files.fetch_add(1, Ordering::Relaxed);
@@ -371,10 +381,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     } else {
-                        pb.set_message(format!("Converted: {}", video.path));
+                        pb.set_message(format!("Converted (not marked as completed in log): {}", video.path));
                     }
                 } else {
-                    pb.set_message(format!("Converted: {}", video.path));
+                    pb.set_message(format!("Converted (skipping MKV delete): {}", video.path));
                 }
             } else {
                 pb.set_message(format!("Converted: {}", video.path));

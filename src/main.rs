@@ -14,6 +14,61 @@ use std::io::{BufRead, BufReader, Write};
 use regex::Regex;
 use std::sync::Mutex;
 use std::collections::HashSet;
+use crossbeam_channel::{bounded, Receiver};
+use std::thread;
+use std::io::Read;  // Add this to your imports
+
+enum ControlMessage {
+    UpdateThreads(usize),
+    Exit,
+}
+
+fn read_char() -> std::io::Result<char> {
+    let mut buffer = [0; 1];
+    std::io::stdin().read_exact(&mut buffer)?;
+    Ok(buffer[0] as char)
+}
+
+fn spawn_control_thread() -> Receiver<ControlMessage> {
+    let (tx, rx) = bounded::<ControlMessage>(10);
+    
+    // Spawn thread to handle user input
+    thread::spawn(move || {
+        println!("\nDynamic controls:");
+        println!("'+' to increase parallel encodes");
+        println!("'-' to decrease parallel encodes");
+        println!("'q' to quit\n");
+
+        loop {
+            if let Ok(input) = read_char() {
+                match input {
+                    '+' => {
+                        let current = rayon::current_num_threads();
+                        if let Ok(_) = rayon::ThreadPoolBuilder::new()
+                            .num_threads(current + 1)
+                            .build_global() {
+                            println!("\nIncreased to {} parallel encodes", current + 1);
+                            let _ = tx.send(ControlMessage::UpdateThreads(current + 1));                        }
+                    },
+                    '-' => {
+                        let current = rayon::current_num_threads();
+                        if current > 1 {
+                            if let Ok(_) = rayon::ThreadPoolBuilder::new()
+                                .num_threads(current - 1)
+                                .build_global() {
+                                println!("\nDecreased to {} parallel encodes", current - 1);
+                                let _ = tx.send(ControlMessage::UpdateThreads(current - 1));                            }
+                        }
+                    },
+                    'q' => break,
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    rx
+}
 
 // Add a new struct to handle logging
 struct CompletedFiles {
@@ -119,6 +174,10 @@ struct Args {
 
     #[arg(long)]
     no_log: bool,
+
+    /// Enable anime-optimized encoding settings
+    #[arg(long)]
+    anime: bool,
 }
 
 struct VideoInfo {
@@ -178,6 +237,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build_global()
         .unwrap();
 
+    // Setup control thread
+    let _control_rx = spawn_control_thread();
+    
     // Check if base directory exists
     if !Path::new(&args.base_dir).exists() {
         eprintln!("Error: Directory '{}' does not exist", args.base_dir);
@@ -291,10 +353,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // Log successful conversion and handle deletion
                     match &completed_files {
                         Some(completed) => {
-                            if let Err(e) = completed.mark_completed(&video.path) {
-                                eprintln!("Failed to log completed file {}: {}", video.path, e);
-                            }
-                            
                             // Only delete if the file isn't already in the completed log
                             if should_delete && !completed.is_completed(&video.path) {
                                 match fs::remove_file(&video.path) {
@@ -381,6 +439,19 @@ fn convert_to_av1(
     };
 
     let audio_channels = get_audio_channels(input_path)?;
+
+    // Build SVT-AV1 params string
+    let mut svtav1_params = format!("tune={}", tune);
+
+    // Only add film grain if it's non-zero (since anime typically doesn't need it)
+    if film_grain > 0 {
+        svtav1_params.push_str(&format!(":film-grain={}", film_grain));
+    }
+    
+    // Add anime-specific optimizations
+    if args.anime {
+        svtav1_params.push_str(":enable-qm=1:enable-overlays=1");
+    }
     
     let mut cmd = Command::new("ffmpeg");
 
@@ -398,7 +469,7 @@ fn convert_to_av1(
     } else {
         cmd.arg("-i")
             .arg(input_path)
-            .arg("-map_metadata")  // Copy all metadata from input
+            .arg("-map")  // Copy all metadata from input
             .arg("0")
             .arg("-c:v")
             .arg("libsvtav1")
@@ -407,7 +478,15 @@ fn convert_to_av1(
             .arg("-crf")
             .arg(crf.to_string())
             .arg("-svtav1-params")
-            .arg(format!("tune={}:film-grain={}", tune, film_grain))
+            .arg(svtav1_params);
+            .arg("-pix_fmt")
+            .arg("yuv420p10le")
+            .arg("-c:s")
+            .arg("copy")
+            .arg("-c:t")
+            .arg("copy")
+            .arg("-c:d")
+            .arg("copy")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
@@ -431,6 +510,14 @@ fn convert_to_av1(
                     // Stereo
                     cmd.arg("-ac").arg("2")
                        .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(96)));
+                },
+                channels if channels >= 8 => {
+                    // 7.1 or higher
+                    cmd.arg("-ac").arg("8")
+                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(512)))
+                       .arg("-mapping_family").arg("1")
+                       .arg("-apply_phase_inv").arg("0")
+                       .arg("-channel_layout").arg("7.1");
                 },
                 channels if channels >= 6 => {
                     // 5.1 or higher
@@ -502,7 +589,11 @@ fn convert_to_av1(
         fs::remove_file(&final_path)?;
     }
     fs::rename(&temp_path, &final_path)?;
-
+    
+    if let Some(completed) = completed_files {
+        if let Err(e) = completed.mark_completed(&final_path) {
+            eprintln!("Failed to log completed file {}: {}", video.path, e);
+    }
     Ok(())
 }
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {

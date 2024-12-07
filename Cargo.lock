@@ -65,6 +65,7 @@ name = "av1_enc"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossbeam-channel",
  "indicatif",
  "num_cpus",
  "rayon",
@@ -142,6 +143,15 @@ dependencies = [
  "libc",
  "unicode-width 0.1.14",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33480d6946193aa8033910124896ca395333cae7e2d1113d1fef6c3272217df2"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]

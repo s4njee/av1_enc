@@ -453,7 +453,7 @@ fn convert_to_av1(
     }
     
     // Add anime-specific optimizations
-    if args.anime {
+    if anime {
         svtav1_params.push_str(":enable-qm=1:enable-overlays=1");
     }
     
@@ -595,8 +595,8 @@ fn convert_to_av1(
     fs::rename(&temp_path, &final_path)?;
     
     if let Some(completed) = completed_files {
-        if let Err(e) = completed.mark_completed(input_path) {
-            eprintln!("Failed to log completed file {}: {}", input_path, e);
+        if let Err(e) = completed.mark_completed(&input_path.to_string_lossy()) {
+            eprintln!("Failed to log completed file {}: {}", &input_path.to_string_lossy(), e);
         }
     }
     Ok(())

@@ -346,7 +346,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	    args.vf.as_deref(),
 	    args.copy_audio,
 	    args.audio_bitrate,
-        completed_files,
+        completed_files.clone(),
 	    &pb,
 	    successful_frames.clone()
 	) { 

@@ -356,20 +356,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                     match &completed_files {
                         Some(completed) => {
                             // Only delete if the file isn't already in the completed log
-                            if should_delete && !completed.is_completed(&video.path) {
-                                match fs::remove_file(&video.path) {
-                                    Ok(_) => {
-                                        deleted_files.fetch_add(1, Ordering::Relaxed);
-                                        pb.set_message(format!("Converted and deleted: {}", video.path));
-                                    },
-                                    Err(e) => {
-                                        eprintln!("Failed to delete {}: {}", video.path, e);
-                                        pb.set_message(format!("Converted (delete failed): {}", video.path));
+                            if should_delete && completed.is_completed(&video.path) {
+                                let is_mkv = Path::new(&video.path)
+                                .extension()
+                                .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
+                            
+                                if !is_mkv {
+                                    match fs::remove_file(&video.path) {
+                                        Ok(_) => {
+                                            deleted_files.fetch_add(1, Ordering::Relaxed);
+                                            pb.set_message(format!("Converted and deleted: {}", video.path));
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Failed to delete {}: {}", video.path, e);
+                                            pb.set_message(format!("Converted (delete failed): {}", video.path));
+                                        }
                                     }
+                                } else {
+                                    pb.set_message(format!("Converted: {}", video.path));
                                 }
-                            } else {
-                                pb.set_message(format!("Converted: {}", video.path));
-                            }
                         },
                         None => {
                             // No logging enabled, proceed with normal deletion

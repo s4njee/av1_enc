@@ -573,7 +573,6 @@ fn convert_to_av1(
                 .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
             
             if !is_mkv { 
-               if can_delete {
                     match fs::remove_file(input_path) {
                         Ok(_) => {
                             deleted_files.fetch_add(1, Ordering::Relaxed);
@@ -584,9 +583,6 @@ fn convert_to_av1(
                             pb.set_message(format!("Converted (delete failed): {}", input_path.display()));
                         }
                     }
-                } else {
-                    pb.set_message(format!("Converted (not marked as completed in log): {}", input_path.display()));
-                }
             } else {
                 pb.set_message(format!("Converted (skipping MKV delete): {}", input_path.display()));
             }

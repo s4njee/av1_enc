@@ -428,6 +428,7 @@ fn convert_to_av1(
     vf: Option<&str>,
     copy_audio: bool,
     audio_bitrate: Option<u32>,
+    completed_files: Option<Arc<CompletedFiles>>,
     pb: &ProgressBar,
     frame_counter: Arc<AtomicUsize>
 ) -> Result<(), Box<dyn Error>> {

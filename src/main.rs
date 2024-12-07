@@ -718,50 +718,70 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
         .unwrap());
     frame_scanning_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let mut video_infos = Vec::new();
-    let mut total_files = 0;
-    let mut total_frames = 0;
-    let mut failed_files = 0;
-    
     // Convert all extensions to lowercase once
     let extensions: Vec<String> = extensions.iter()
         .map(|ext| ext.trim().to_lowercase())
         .collect();
 
-    for entry in WalkDir::new(base_dir) {
-        if let Ok(entry) = entry {
+    // First collect all matching files
+    let matching_files: Vec<_> = WalkDir::new(base_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
             if let Some(ext) = entry.path().extension() {
                 let ext_lower = ext.to_string_lossy().to_lowercase();
-                if extensions.contains(&ext_lower) {
-                    total_files += 1;
-                    frame_scanning_pb.inc(1);
-                    frame_scanning_pb.set_message(entry.path().display().to_string());
-
-                    match get_frame_count(entry.path()) {
-                        Ok(frame_count) => {
-                            total_frames += frame_count;
-                            video_infos.push(VideoInfo {
-                                path: entry.path().to_string_lossy().into_owned(),
-                            });
-                        }
-                        Err(e) => {
-                            failed_files += 1;
-                            eprintln!("Skipping {}: ffprobe failed: {}", entry.path().display(), e);
-                            continue;
-                        }
-                    }
-                }
+                extensions.contains(&ext_lower)
+            } else {
+                false
             }
-        }
-    }
+        })
+        .collect();
+
+    let total_files = matching_files.len();
+    frame_scanning_pb.set_message("Analyzing files in parallel...");
+
+    // Atomic counters for thread-safe counting
+    let total_frames = Arc::new(AtomicUsize::new(0));
+    let failed_files = Arc::new(AtomicUsize::new(0));
+    let processed_files = Arc::new(AtomicUsize::new(0));
+
+    // Process files in parallel
+    let video_infos: Vec<_> = matching_files.par_iter()
+        .filter_map(|entry| {
+            let path_display = entry.path().display().to_string();
+            frame_scanning_pb.set_message(path_display.clone());
+            
+            let result = match get_frame_count(entry.path()) {
+                Ok(frame_count) => {
+                    total_frames.fetch_add(frame_count, Ordering::Relaxed);
+                    Some(VideoInfo {
+                        path: entry.path().to_string_lossy().into_owned(),
+                    })
+                }
+                Err(e) => {
+                    eprintln!("Skipping {}: ffprobe failed: {}", path_display, e);
+                    failed_files.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+
+            processed_files.fetch_add(1, Ordering::Relaxed);
+            frame_scanning_pb.set_position(processed_files.load(Ordering::Relaxed) as u64);
+            
+            result
+        })
+        .collect();
+
+    let final_total_frames = total_frames.load(Ordering::Relaxed);
+    let final_failed_files = failed_files.load(Ordering::Relaxed);
 
     frame_scanning_pb.finish_with_message(format!(
         "Scanned {} files ({} skipped due to ffprobe failures)", 
         total_files,
-        failed_files
+        final_failed_files
     ));
     
-    Ok((video_infos, total_frames, total_files))
+    Ok((video_infos, final_total_frames, total_files))
 }
 
 fn prompt_yes_no(question: &str) -> bool {

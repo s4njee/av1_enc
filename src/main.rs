@@ -119,7 +119,6 @@ struct Args {
     #[arg(short = 'k', long)]
     copy_audio: bool,
 
-    
     /// Number of parallel videos to process (default: number of CPU cores)
     #[arg(short = 'j', long, default_value_t = num_cpus::get())]
     threads: usize,
@@ -149,7 +148,7 @@ fn get_audio_stream_count(path: &Path) -> Result<u32, Box<dyn Error>> {
         .output()?;
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    
+
     if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
         return Ok(streams.len() as u32);
     }
@@ -340,9 +339,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             args.audio_bitrate,
             &pb,
             successful_frames.clone(),
-            &args.audio_stream,        // Add this
-            &args.audio2_codec,        // Add this
-            args.audio2_bitrate, 
+            &args.audio_stream, // Add this
+            &args.audio2_codec, // Add this
+            args.audio2_bitrate,
         ) {
             Ok(_) => {
                 successful_conversions.fetch_add(1, Ordering::Relaxed);
@@ -503,55 +502,77 @@ fn convert_to_av1(
         if let Some(filter) = vf {
             cmd.arg("-vf").arg(filter);
         }
-    
-        // Handle audio stream selection
-        match audio_stream {
+
+        // First check audio stream count and adjust selection accordingly
+        let effective_stream_selection =
+            if audio_stream_count < 2 && (audio_stream == "2" || audio_stream == "both") {
+                pb.println(format!(
+                    "Note: Only one audio stream found, using first stream"
+                ));
+                "1"
+            } else {
+                audio_stream
+            };
+
+        // Now handle the stream mapping based on what's actually available
+        match effective_stream_selection {
             "1" => {
                 // Only first audio stream
-                cmd.arg("-map").arg("0:v:0")  // First video stream
-                    .arg("-map").arg("0:a:0"); // First audio stream
-                
+                cmd.arg("-map")
+                    .arg("0:v:0") // First video stream
+                    .arg("-map")
+                    .arg("0:a:0"); // First audio stream
+
                 if copy_audio {
-                    cmd.arg("-c:a:0").arg("copy");
+                    cmd.arg("-c:a").arg("copy");
                 } else {
                     add_audio_encoding_args(&mut cmd, 0, audio_channels, audio_bitrate, "libopus");
                 }
-            },
+            }
             "2" => {
-                if audio_stream_count >= 2 {
-                    // Only second audio stream
-                    cmd.arg("-map").arg("0:v:0")  // First video stream
-                        .arg("-map").arg("0:a:1"); // Second audio stream
-                    
-                    if copy_audio {
-                        cmd.arg("-c:a:0").arg("copy");
-                    } else {
-                        add_audio_encoding_args(&mut cmd, 0, audio_channels, audio_bitrate, "libopus");
-                    }
+                // We know we have 2 streams because of the check above
+                cmd.arg("-map")
+                    .arg("0:v:0") // First video stream
+                    .arg("-map")
+                    .arg("0:a:1"); // Second audio stream
+
+                if copy_audio {
+                    cmd.arg("-c:a").arg("copy");
                 } else {
-                    return Err("Second audio stream requested but not available".into());
+                    add_audio_encoding_args(&mut cmd, 0, audio_channels, audio_bitrate, "libopus");
                 }
-            },
+            }
             "both" => {
-                if audio_stream_count >= 2 {
-                    // Both audio streams
-                    cmd.arg("-map").arg("0:v:0")  // First video stream
-                        .arg("-map").arg("0:a:0")  // First audio stream
-                        .arg("-map").arg("0:a:1"); // Second audio stream
-                    
-                    if copy_audio {
-                        cmd.arg("-c:a:0").arg("copy")
-                            .arg("-c:a:1").arg("copy");
-                    } else {
-                        add_audio_encoding_args(&mut cmd, 0, audio_channels, audio_bitrate, "libopus");
-                        add_audio_encoding_args(&mut cmd, 1, audio_channels, audio2_bitrate, audio2_codec);
-                    }
+                // We know we have 2 streams because of the check above
+                cmd.arg("-map")
+                    .arg("0:v:0") // First video stream
+                    .arg("-map")
+                    .arg("0:a:0") // First audio stream
+                    .arg("-map")
+                    .arg("0:a:1"); // Second audio stream
+
+                if copy_audio {
+                    cmd.arg("-c:a").arg("copy");
                 } else {
-                    return Err("Both audio streams requested but second stream not available".into());
+                    // First audio stream
+                    add_audio_encoding_args(&mut cmd, 0, audio_channels, audio_bitrate, "libopus");
+
+                    let second_codec = if audio2_codec == "opus" {
+                        "libopus"
+                    } else {
+                        audio2_codec
+                    };
+                    add_audio_encoding_args(
+                        &mut cmd,
+                        1,
+                        audio_channels,
+                        audio2_bitrate.or(audio_bitrate),
+                        second_codec,
+                    );
                 }
-            },
+            }
             _ => return Err("Invalid audio stream selection".into()),
-        }
+        };
 
         cmd.arg("-progress")
             .arg("pipe:1")
@@ -560,9 +581,8 @@ fn convert_to_av1(
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
     }
-    
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null());
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
     let mut process = cmd.spawn()?;
 
@@ -619,39 +639,50 @@ fn convert_to_av1(
     fs::rename(&temp_path, &final_path)?;
 
     Ok(())
-
 }
 
-fn add_audio_encoding_args(cmd: &mut Command, stream_index: u32, channels: u32, bitrate: Option<u32>, codec: &str) {
+fn add_audio_encoding_args(
+    cmd: &mut Command,
+    stream_index: u32,
+    channels: u32,
+    bitrate: Option<u32>,
+    codec: &str,
+) {
     cmd.arg(format!("-c:a:{}", stream_index)).arg(codec);
-    
+
     match channels {
         1 => {
-            cmd.arg(format!("-ac:{}", stream_index)).arg("1")
-               .arg(format!("-b:a:{}", stream_index))
-               .arg(format!("{}k", bitrate.unwrap_or(64)));
-        },
+            cmd.arg(format!("-ac:{}", stream_index))
+                .arg("1")
+                .arg(format!("-b:a:{}", stream_index))
+                .arg(format!("{}k", bitrate.unwrap_or(64)));
+        }
         2 => {
-            cmd.arg(format!("-ac:{}", stream_index)).arg("2")
-               .arg(format!("-b:a:{}", stream_index))
-               .arg(format!("{}k", bitrate.unwrap_or(96)));
-        },
+            cmd.arg(format!("-ac:{}", stream_index))
+                .arg("2")
+                .arg(format!("-b:a:{}", stream_index))
+                .arg(format!("{}k", bitrate.unwrap_or(96)));
+        }
         channels if channels >= 6 => {
-            cmd.arg(format!("-ac:{}", stream_index)).arg("6")
-               .arg(format!("-b:a:{}", stream_index))
-               .arg(format!("{}k", bitrate.unwrap_or(384)))
-               .arg("-mapping_family").arg("1")
-               .arg("-apply_phase_inv").arg("0")
-               .arg("-channel_layout").arg("5.1");
-        },
+            cmd.arg(format!("-ac:{}", stream_index))
+                .arg("6")
+                .arg(format!("-b:a:{}", stream_index))
+                .arg(format!("{}k", bitrate.unwrap_or(384)))
+                .arg("-mapping_family")
+                .arg("1")
+                .arg("-apply_phase_inv")
+                .arg("0")
+                .arg("-channel_layout")
+                .arg("5.1");
+        }
         _ => {
-            cmd.arg(format!("-ac:{}", stream_index)).arg("2")
-               .arg(format!("-b:a:{}", stream_index))
-               .arg(format!("{}k", bitrate.unwrap_or(96)));
-        },
+            cmd.arg(format!("-ac:{}", stream_index))
+                .arg("2")
+                .arg(format!("-b:a:{}", stream_index))
+                .arg(format!("{}k", bitrate.unwrap_or(96)));
+        }
     }
 }
-
 
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
     let output = Command::new("ffprobe")
@@ -816,11 +847,12 @@ fn scan_video_files(
     let processed_files = Arc::new(AtomicUsize::new(0));
 
     // Process files in parallel
-    let video_infos: Vec<_> = matching_files.par_iter()
+    let video_infos: Vec<_> = matching_files
+        .par_iter()
         .filter_map(|entry| {
             let path_display = entry.path().display().to_string();
             frame_scanning_pb.set_message(path_display.clone());
-            
+
             let result = match get_frame_count(entry.path()) {
                 Ok(frame_count) => {
                     total_frames.fetch_add(frame_count, Ordering::Relaxed);
@@ -837,7 +869,7 @@ fn scan_video_files(
 
             processed_files.fetch_add(1, Ordering::Relaxed);
             frame_scanning_pb.set_position(processed_files.load(Ordering::Relaxed) as u64);
-            
+
             result
         })
         .collect();
@@ -846,11 +878,10 @@ fn scan_video_files(
     let final_failed_files = failed_files.load(Ordering::Relaxed);
 
     frame_scanning_pb.finish_with_message(format!(
-        "Scanned {} files ({} skipped due to ffprobe failures)", 
-        total_files,
-        final_failed_files
+        "Scanned {} files ({} skipped due to ffprobe failures)",
+        total_files, final_failed_files
     ));
-    
+
     Ok((video_infos, final_total_frames, total_files))
 }
 

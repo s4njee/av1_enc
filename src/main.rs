@@ -334,7 +334,6 @@ fn main() -> Result<(), Box<dyn Error>> {
       let (video_tx, video_rx) = bounded::<()>(1);
 
       // Spawn video processing in separate thread
-      thread::spawn(move || {
     video_infos.par_iter()
         .for_each(|video| {
 
@@ -375,7 +374,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } 
     let _ = video_tx.send(());  // Signal completion
 });
-        });
     let mut remaining_videos = total_videos;  // Use our saved count
     // Monitor both video completion and control messages
     loop {

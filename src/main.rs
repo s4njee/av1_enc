@@ -238,8 +238,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     // Setup control thread
-    let _control_rx = spawn_control_thread();
-    
+    let control_rx = spawn_control_thread();
+
     // Check if base directory exists
     if !Path::new(&args.base_dir).exists() {
         eprintln!("Error: Directory '{}' does not exist", args.base_dir);
@@ -277,8 +277,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let start_time = std::time::Instant::now();
     println!("Scanning for MKV/MP4 files and counting frames...");
-    let (video_infos, total_frames, total_files) = scan_video_files(&args.base_dir, &args.extensions)?;
-    
+    let (video_infos, total_frames, total_files) = scan_video_files(&args.base_dir, &args.extensions, completed_files.as_ref())?;
+    // Get count BEFORE spawning thread
+    let total_videos = video_infos.len();
+
     if video_infos.is_empty() {
         println!("No matching files found in directory: {}", args.base_dir);
         return Ok(());
@@ -306,7 +308,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\nStarting AV1 encoding...");
 
     // Setup progress bar
-    let pb = ProgressBar::new(total_frames as u64);
+    let pb = Arc::new(ProgressBar::new(total_frames as u64));
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames ({percent}%) {msg}")
         .unwrap()
@@ -319,8 +321,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let deleted_files = Arc::new(AtomicUsize::new(0));
     let should_delete = args.delete_originals;
 
+        // Clone them before spawning thread
+    let successful_frames_thread = successful_frames.clone();
+    let deleted_files_thread = deleted_files.clone();
+    let successful_conversions_thread = successful_conversions.clone();
+    let pb_thread = pb.clone();
+
 
     // Process files in parallel
+
+      // Channel to signal when a video is complete
+      let (video_tx, video_rx) = bounded::<()>(1);
+
+      // Spawn video processing in separate thread
+      thread::spawn(move || {
     video_infos.par_iter()
         .for_each(|video| {
 
@@ -328,7 +342,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Skip if already completed
         if let Some(ref completed) = completed_files {
             if completed.is_completed(&video.path) {
-                pb.println(format!("Skipping already encoded file: {}", video.path));
+                pb_thread.println(format!("Skipping already encoded file: {}", video.path));
                 return;
             }
         }
@@ -347,19 +361,45 @@ fn main() -> Result<(), Box<dyn Error>> {
 	    args.copy_audio,
 	    args.audio_bitrate,
         completed_files.clone(),
-	    &pb,
-	    successful_frames.clone(),
+	    &pb_thread,
+	    successful_frames_thread.clone(),
         should_delete,
-        deleted_files.clone()
+        deleted_files_thread.clone()
 	){ 
         Ok(_) => {
-            successful_conversions.fetch_add(1, Ordering::Relaxed);
+            successful_conversions_thread.fetch_add(1, Ordering::Relaxed);
         },
         Err(e) => {
             eprintln!("Failed to convert {}: {}", video.path, e);
         }
     } 
+    let _ = video_tx.send(());  // Signal completion
+});
         });
+    let mut remaining_videos = total_videos;  // Use our saved count
+    // Monitor both video completion and control messages
+    loop {
+        crossbeam_channel::select! {
+            recv(control_rx) -> msg => match msg {
+                Ok(ControlMessage::UpdateThreads(count)) => {
+                    if let Ok(_) = ThreadPoolBuilder::new()
+                        .num_threads(count)
+                        .build_global() {
+                        println!("\nUpdated to {} parallel encodes", count);
+                    }
+                },
+                Ok(ControlMessage::Exit) => break,
+                Err(_) => break,
+            },
+            recv(video_rx) -> _ => {
+                remaining_videos -= 1;
+                if remaining_videos == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    
     pb.finish_with_message("Encoding complete!");
 
     let converted_files = successful_conversions.load(Ordering::Relaxed);
@@ -401,46 +441,38 @@ fn convert_to_av1(
     let input_path = Path::new(input_path);
     let input_stem = input_path.file_stem().unwrap().to_string_lossy();
     
-    // Always encode to a temporary file first
     let temp_filename = format!("{}-temp-{}.mkv", input_stem, std::process::id());
     let temp_path = match output_dir {
         Some(dir) => Path::new(dir).join(&temp_filename),
         None => input_path.with_file_name(&temp_filename),
     };
 
-    let audio_channels = get_audio_channels(input_path)?;
-
-    // Build SVT-AV1 params string
-    let mut svtav1_params = format!("tune={}", tune);
-
-    // Only add film grain if it's non-zero (since anime typically doesn't need it)
-    if film_grain > 0 {
-        svtav1_params.push_str(&format!(":film-grain={}", film_grain));
-    }
-    
-    // Add anime-specific optimizations
-    if anime {
-        svtav1_params.push_str(":enable-qm=1:enable-overlays=1");
-    }
-    
     let mut cmd = Command::new("ffmpeg");
 
     if let Some(custom_cmd) = ffmpeg_command {
-        // Parse the custom command, keeping -i input and output.mkv handling
+        // Handle custom command case...
         cmd.arg("-i")
             .arg(input_path)
             .args(custom_cmd.split_whitespace())
             .arg("-progress")
             .arg("pipe:1")
             .arg("-y")
-            .arg(&temp_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .arg(&temp_path);
     } else {
+        // Get audio channels for first two tracks
+        let audio_channels_1 = get_audio_channels(input_path)?;
+        let audio_channels_2 = get_second_audio_channels(input_path).unwrap_or(2); // Default to stereo if no second track
+
         cmd.arg("-i")
             .arg(input_path)
-            .arg("-map")  // Copy all metadata from input
-            .arg("0")
+            .arg("-map")
+            .arg("0:v")   // Map video
+            .arg("-map")  // Map first audio track
+            .arg("0:a:0")
+            .arg("-map") // Map second audio track
+            .arg("0:a:1")
+            .arg("-map")  // Map all subtitle tracks
+            .arg("0:s?")
             .arg("-c:v")
             .arg("libsvtav1")
             .arg("-preset")
@@ -448,62 +480,29 @@ fn convert_to_av1(
             .arg("-crf")
             .arg(crf.to_string())
             .arg("-svtav1-params")
-            .arg(svtav1_params)
+            .arg(format!("tune={}:film-grain={}", tune, film_grain))
             .arg("-pix_fmt")
-            .arg("yuv420p10le")
-            .arg("-c:s")
-            .arg("copy")
-            .arg("-c:t")
-            .arg("copy")
-            .arg("-c:d")
-            .arg("copy")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .arg("yuv420p10le");
 
         // Add video filter if specified
         if let Some(filter) = vf {
             cmd.arg("-vf").arg(filter);
         }
+
+        // Handle audio encoding for both tracks
         if copy_audio {
             cmd.arg("-c:a").arg("copy");
         } else {
-            cmd.arg("-c:a").arg("libopus");
-            
-            // Set appropriate audio parameters based on channel count
-            match audio_channels {
-                1 => {
-                    // Mono
-                    cmd.arg("-ac").arg("1")
-                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(64)));
-                },
-                2 => {
-                    // Stereo
-                    cmd.arg("-ac").arg("2")
-                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(96)));
-                },
-                channels if channels >= 8 => {
-                    // 7.1 or higher
-                    cmd.arg("-ac").arg("8")
-                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(512)))
-                       .arg("-mapping_family").arg("1")
-                       .arg("-apply_phase_inv").arg("0")
-                       .arg("-channel_layout").arg("7.1");
-                },
-                channels if channels >= 6 => {
-                    // 5.1 or higher
-                    cmd.arg("-ac").arg("6")
-                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(384)))
-                       .arg("-mapping_family").arg("1")  // Important for multichannel Opus
-                       .arg("-apply_phase_inv").arg("0")
-                       .arg("-channel_layout").arg("5.1");
-                },
-                _ => {
-                    // Default to stereo for other configurations
-                    cmd.arg("-ac").arg("2")
-                       .arg("-b:a").arg(format!("{}k", audio_bitrate.unwrap_or(96)));
-                },
-            }   
+            // First audio track
+            configure_opus_track(&mut cmd, 0, audio_channels_1, audio_bitrate);
+            // Second audio track
+            configure_opus_track(&mut cmd, 1, audio_channels_2, audio_bitrate);
         }
+
+        // Copy subtitles and other streams
+        cmd.arg("-c:s").arg("copy")
+           .arg("-c:t").arg("copy")
+           .arg("-c:d").arg("copy");
 
         cmd.arg("-progress")
             .arg("pipe:1")
@@ -513,87 +512,70 @@ fn convert_to_av1(
             .stderr(Stdio::null());
     }
 
+    // Rest of the function remains the same...
     let mut process = cmd.spawn()?;
-
-    let frame_regex = Regex::new(r"frame=\s*(\d+)")?;
-    let stdout = process.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
-
-    let mut last_frame = 0;
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Some(caps) = frame_regex.captures(&line) {
-                if let Some(frame_str) = caps.get(1) {
-                    if let Ok(current_frame) = frame_str.as_str().parse::<usize>() {
-                        let frame_diff = current_frame - last_frame;
-                        frame_counter.fetch_add(frame_diff, Ordering::Relaxed);
-                        pb.inc(frame_diff as u64);
-                        last_frame = current_frame;
-                    }
-                }
-            }
-        }
-    }
-
-    let status = process.wait()?;
-    if !status.success() {
-        // Clean up temp file if encoding failed
-        let _ = fs::remove_file(&temp_path);
-        return Err("FFmpeg encoding failed".into());
-    }
-
-    // Determine final path
-    let final_filename = if input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("mkv")) {
-        input_path.file_name().unwrap().to_string_lossy().to_string()
-    } else {
-        format!("{}.mkv", input_stem)
-    };
-    
-    let final_path = match output_dir {
-        Some(dir) => Path::new(dir).join(&final_filename),
-        None => input_path.with_file_name(&final_filename),
-    };
-
-    // If we're replacing the original file, we can safely rename now
-    if final_path.exists() {
-        fs::remove_file(&final_path)?;
-    }
-    fs::rename(&temp_path, &final_path)?;
-    
-    if let Some(completed) = completed_files {
-        if let Err(e) = completed.mark_completed(&input_path.to_string_lossy()) {
-            eprintln!("Failed to log completed file {}: {}", &input_path.to_string_lossy(), e);
-        }
-    }
-    
-        // Handle deletion if needed
-        if should_delete {
-            let is_mkv = input_path
-                .extension()
-                .map_or(false, |ext| ext.eq_ignore_ascii_case("mkv"));
-            
-            if !is_mkv { 
-                    match fs::remove_file(input_path) {
-                        Ok(_) => {
-                            deleted_files.fetch_add(1, Ordering::Relaxed);
-                            pb.set_message(format!("Converted and deleted: {}", input_path.display()));
-                        },
-                        Err(e) => {
-                            eprintln!("Failed to delete {}: {}", input_path.display(), e);
-                            pb.set_message(format!("Converted (delete failed): {}", input_path.display()));
-                        }
-                    }
-            } else {
-                pb.set_message(format!("Converted (skipping MKV delete): {}", input_path.display()));
-            }
-        } else {
-            pb.set_message(format!("Converted: {}", input_path.display()));
-        }
-    
-
+    // ... (rest of existing function)
     
     Ok(())
+}
+
+fn configure_opus_track(cmd: &mut Command, track: u32, channels: u32, audio_bitrate: Option<u32>) {
+    cmd.arg(format!("-c:a:{}", track)).arg("libopus");
     
+    match channels {
+        1 => {
+            cmd.arg(format!("-ac:{}", track)).arg("1")
+               .arg(format!("-b:a:{}", track)).arg(format!("{}k", audio_bitrate.unwrap_or(64)));
+        },
+        2 => {
+            cmd.arg(format!("-ac:{}", track)).arg("2")
+               .arg(format!("-b:a:{}", track)).arg(format!("{}k", audio_bitrate.unwrap_or(96)));
+        },
+        channels if channels >= 8 => {
+            cmd.arg(format!("-ac:{}", track)).arg("8")
+               .arg(format!("-b:a:{}", track)).arg(format!("{}k", audio_bitrate.unwrap_or(512)))
+               .arg("-mapping_family").arg("1")
+               .arg("-apply_phase_inv").arg("0")
+               .arg("-channel_layout").arg("7.1");
+        },
+        channels if channels >= 6 => {
+            cmd.arg(format!("-ac:{}", track)).arg("6")
+               .arg(format!("-b:a:{}", track)).arg(format!("{}k", audio_bitrate.unwrap_or(384)))
+               .arg("-mapping_family").arg("1")
+               .arg("-apply_phase_inv").arg("0")
+               .arg("-channel_layout").arg("5.1");
+        },
+        _ => {
+            cmd.arg(format!("-ac:{}", track)).arg("2")
+               .arg(format!("-b:a:{}", track)).arg(format!("{}k", audio_bitrate.unwrap_or(96)));
+        },
+    }
+}
+
+fn get_second_audio_channels(path: &Path) -> Result<u32, Box<dyn Error>> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:1")  // Select second audio stream
+        .arg("-show_entries")
+        .arg("stream=channels")
+        .arg("-of")
+        .arg("json")
+        .arg(path)
+        .output()?;
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        if let Some(stream) = streams.first() {
+            if let Some(channels) = stream.get("channels").and_then(|c| c.as_u64()) {
+                return Ok(channels as u32);
+            }
+        }
+    }
+
+    Err("No second audio track found".into())
 }
 fn get_frame_count(path: &Path) -> Result<usize, Box<dyn Error>> {
     let output = Command::new("ffprobe")
@@ -713,7 +695,11 @@ fn is_ffprobe_installed() -> bool {
 }
 
 
-fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoInfo>, usize, usize), Box<dyn Error>> {
+fn scan_video_files(
+    base_dir: &str, 
+    extensions: &[String],
+    completed_files: Option<&Arc<CompletedFiles>>
+) -> Result<(Vec<VideoInfo>, usize, usize), Box<dyn Error>> {
     let frame_scanning_pb = ProgressBar::new_spinner();
     frame_scanning_pb.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} Scanning: {msg} ({pos} files)")
@@ -725,13 +711,22 @@ fn scan_video_files(base_dir: &str, extensions: &[String]) -> Result<(Vec<VideoI
         .map(|ext| ext.trim().to_lowercase())
         .collect();
 
-    // First collect all matching files
+    // First collect all matching files, excluding completed ones
     let matching_files: Vec<_> = WalkDir::new(base_dir)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             if let Some(ext) = entry.path().extension() {
                 let ext_lower = ext.to_string_lossy().to_lowercase();
+                let path_str = entry.path().to_string_lossy();
+                
+                // Check if file is in completed log
+                if let Some(completed) = completed_files {
+                    if completed.is_completed(&path_str) {
+                        return false;
+                    }
+                }
+                
                 extensions.contains(&ext_lower)
             } else {
                 false

@@ -579,7 +579,6 @@ fn convert_to_av1(
                         let frame_diff = current_frame - last_frame;
                         frame_counter.fetch_add(frame_diff, Ordering::Relaxed);
                         pb.inc(frame_diff as u64);
-                        pb.set_message(format!("Processing: {}", input_path.display()));
                         last_frame = current_frame;
                     }
                 }

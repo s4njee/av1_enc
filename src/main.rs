@@ -303,7 +303,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\nStarting AV1 encoding...");
 
     // Setup progress bar
-    let pb = ProgressBar::new(total_frames as u64);
+    // Setup global progress bar
+    let pb = Arc::new(ProgressBar::new(total_frames as u64));
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames ({percent}%) {msg}")
         .unwrap()
@@ -560,6 +561,8 @@ fn convert_to_av1(
             .stderr(Stdio::null());
     }
     
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
     let mut process = cmd.spawn()?;
 
@@ -576,6 +579,7 @@ fn convert_to_av1(
                         let frame_diff = current_frame - last_frame;
                         frame_counter.fetch_add(frame_diff, Ordering::Relaxed);
                         pb.inc(frame_diff as u64);
+                        pb.set_message(format!("Processing: {}", input_path.display()));
                         last_frame = current_frame;
                     }
                 }

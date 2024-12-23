@@ -931,7 +931,7 @@ fn validate_arguments(args: &Args) -> Result<(), Box<dyn Error>> {
     if args.crf > 63 {
         return Err("CRF must be between 0 and 63".into());
     }
-    if args.tune > 2 {
+    if args.tune > 4 {
         return Err("Tune must be between 0 and 2".into());
     }
     if args.threads < 1 {

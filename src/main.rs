@@ -132,6 +132,11 @@ struct Args {
 
     #[arg(long)]
     no_log: bool,
+
+    /// Include subtitles from source or external .srt files
+    #[arg(short = 's', long)]
+    include_subtitles: bool,
+
 }
 
 fn get_audio_stream_count(path: &Path) -> Result<u32, Box<dyn Error>> {
@@ -342,6 +347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &args.audio_stream, // Add this
             &args.audio2_codec, // Add this
             args.audio2_bitrate,
+            args.include_subtitles
         ) {
             Ok(_) => {
                 successful_conversions.fetch_add(1, Ordering::Relaxed);
@@ -456,6 +462,7 @@ fn convert_to_av1(
     audio_stream: &str,
     audio2_codec: &str,
     audio2_bitrate: Option<u32>,
+    subtitles: bool
 ) -> Result<(), Box<dyn Error>> {
     let input_path = Path::new(input_path);
     let input_stem = input_path.file_stem().unwrap().to_string_lossy();
@@ -495,9 +502,14 @@ fn convert_to_av1(
             .arg(crf.to_string())
             .arg("-svtav1-params")
             .arg(format!("tune={}:film-grain={}", tune, film_grain))
+            .arg("-pix_fmt")
+            .arg("yuv420p10le")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
+            if subtitles {
+                cmd.arg("-map").arg("0:s");
+            }
         // Add video filter if specified
         if let Some(filter) = vf {
             cmd.arg("-vf").arg(filter);
